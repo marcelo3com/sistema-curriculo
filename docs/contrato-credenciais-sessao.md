@@ -1,227 +1,163 @@
-# Contrato de credenciais de sessão
+# Contrato de Credenciais e Ciclo de Sessão
 
-## Objetivo e escopo
+- **Referência:** Task `[F12.2] #418` (Documentar o contrato de credenciais e o ciclo de sessão depois da conclusão dos cards #80–#82)
+- **Fatias Técnicas Relacionadas:** Cards `#80` (Armazenamento de Sessões), `#81` (Middleware de Autenticação) e `#82` (Endpoints de Sessão)
+- **Documentador Oficial:** Marcelo Aparecido da Rosa ([@marcelo-3com](https://github.com/marcelo-3com))
+- **Líder Técnico e QA Arquitetural:** Rodolpho P. M. Ferreira
+- **Responsável por CI/CD e Middleware de Segurança:** Kelly Daiane Miranda Mendes
+- **Versão:** 1.1.0
+- **Data:** Novembro de 2026
 
-Este documento define como a API emite, transporta, valida e revoga a
-credencial que representa uma sessão autenticada. Ele complementa o
-[planejamento de autenticação](requisitos-seguranca.md#26-sessão) e a
-[interface das rotas protegidas](requisitos-seguranca.md#9-interface-de-autenticação-para-rotas-protegidas).
+---
 
-O contrato cobre sessões da aplicação web. Integrações entre serviços e tokens
-de API pertencem a contratos separados.
+## 1. Objetivo e Escopo
 
-## Decisões do contrato
+Este documento define formalmente como o **Sistema Currículo (Grupo 1)** emite, transporta, valida, renova e revoga as credenciais que representam uma sessão autenticada de estudante. Ele consolida as implementações realizadas nos cards **#80, #81 e #82**, complementando o planejamento de autenticação e a segurança de rotas protegidas da plataforma.
 
-- A sessão é **opaca e mantida no servidor**; não é JWT nem contém dados de
-  identidade ou autorização legíveis pelo cliente.
-- A credencial é transportada exclusivamente por cookie. A API NÃO DEVE aceitá-la
-  em `Authorization`, query string ou corpo da requisição.
-- Uma sessão dura no máximo **8 horas** desde sua criação. Não há renovação
-  automática nem extensão por atividade; após expirar, o usuário autentica-se
-  novamente.
-- Uma conta pode manter mais de uma sessão ativa, por exemplo em dispositivos
-  diferentes. Logout revoga somente a sessão apresentada naquela requisição.
+O contrato cobre exclusivamente as sessões de usuários da aplicação web. Integrações entre sistemas (como a comunicação com o Grupo 2) utilizam contratos de serviços específicos.
 
-## Credencial e armazenamento
+---
 
-Após validar as credenciais, a API gera 32 bytes usando um gerador
-criptograficamente seguro e codifica-os em Base64 URL-safe sem padding. O valor
-resultante é o token opaco da sessão. Ele não contém `usuario_id`, papel,
-permissões, timestamps ou outros atributos interpretáveis pelo cliente.
+## 2. Diagrama do Ciclo de Vida da Sessão (Mermaid)
 
-O token em claro só é entregue uma vez no cabeçalho `Set-Cookie`. A persistência
-guarda somente seu resumo SHA-256, com índice único, nunca o token em claro. A
-entropia de 256 bits torna inviável adivinhar o token; o resumo permite localizar
-a sessão sem manter uma credencial reutilizável no banco.
+O ciclo de vida da sessão — desde o login, validação em cada requisição protegida via middleware até a revogação no logout — é detalhado no diagrama abaixo:
 
-O registro de sessão contém, no mínimo:
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Aluno as Estudante
+    participant UI as Frontend Web
+    participant MW as MiddlewareAutenticacaoSessao
+    participant API as Endpoints / Controllers
+    participant DB as Banco de Dados (Tabela sessao)
 
-| Campo | Significado |
-|---|---|
-| `sessao_id` | Identificador interno UUID, sem valor de autenticação para o cliente. |
-| `usuario_id` | Conta proprietária da sessão. |
-| `token_hash` | SHA-256 do token recebido no cookie; único e nunca devolvido pela API. |
-| `criada_em` | Instante UTC de emissão. |
-| `expira_em` | Instante UTC igual a `criada_em + 8 horas`. |
-| `revogada_em` | Instante UTC da revogação, nulo enquanto ativa. |
+    %% 1. Criação de Sessão
+    Note over Aluno,DB: 1. Criação de Sessão (Login - Card #82)
+    Aluno->>UI: Informa email e senha
+    UI->>API: POST /acessos (JSON: email, senha)
+    API->>DB: Valida hash de senha do estudante
+    alt Credenciais Válidas
+        API->>API: Gera token opaco (32 bytes cryptosafe)
+        API->>DB: Salva SHA-256(token), usuario_id, expira_em (+8h)
+        API-->>UI: HTTP 204 No Content + Set-Cookie (__Host-sessao; HttpOnly; Secure; SameSite=Lax)
+        UI-->>Aluno: Acesso liberado ao painel
+    else Credenciais Inválidas
+        API-->>UI: HTTP 401 Unauthorized (Mensagem uniforme)
+        UI-->>Aluno: Exibe erro de autenticação
+    end
 
-O mapeamento e as migrations ficam na infraestrutura. A identidade confiável
-entregue à API é um contexto mínimo `UsuarioAutenticado(usuario_id: UUID)`;
-token, hash, timestamps e estado de persistência não são expostos ao caso de uso.
+    %% 2. Validação Contínua
+    Note over Aluno,DB: 2. Requisição em Rota Privada (Middleware - Card #81)
+    Aluno->>UI: Acessa rota privada (ex: GET /curriculo)
+    UI->>MW: Requisição HTTP com Cookie: __Host-sessao
+    MW->>MW: Calcula SHA-256 do token recebido
+    MW->>DB: Busca registro onde token_hash = SHA-256 e revogada_em IS NULL
+    alt Sessão Válida e Ativa
+        MW->>MW: Injeta request.state.usuario_id e X-Correlation-ID
+        MW->>API: Prossegue execução do caso de uso
+        API-->>UI: HTTP 200 OK com dados do estudante
+    else Sessão Expirada ou Inexistente
+        MW-->>UI: HTTP 401 Unauthorized ("Sessão ausente ou inválida.")
+        UI-->>Aluno: Redireciona para tela de login
+    end
 
-## Cookie HTTP
+    %% 3. Encerramento
+    Note over Aluno,DB: 3. Encerramento de Sessão (Logout - Card #82)
+    Aluno->>UI: Clica em "Sair da Conta"
+    UI->>API: DELETE /sessao/atual
+    API->>DB: Atualiza revogada_em = NOW()
+    API-->>UI: HTTP 204 No Content + Set-Cookie (__Host-sessao=deleted; Max-Age=0)
+    UI-->>Aluno: Sessão encerrada com segurança
+```
 
-Em produção, o nome do cookie é `__Host-sessao`. O cabeçalho de sucesso no
-login deve equivaler a:
+---
+
+## 3. Decisões Arquiteturais Fundamentais
+
+1. **Sessão Opaca e no Servidor:**  
+   A sessão **não é um JWT** legível pelo cliente. É um identificador opaco aleatório de alta entropia. Nenhum dado do estudante (`usuario_id`, papéis, permissões) trafega dentro do token.
+2. **Transporte Estritamente por Cookie:**  
+   A credencial trafega exclusivamente via cookie HTTP. A API **não aceita** tokens de sessão em cabeçalhos `Authorization`, parâmetros de URL (*query string*) ou corpos de requisição.
+3. **Tempo de Vida Fixo (TTL de 8 Horas):**  
+   A sessão expira em exatamente **8 horas** a partir da criação (`criada_em + 8 horas`). Não há renovação deslizante automática por inatividade, forçando reautenticação periódica segura.
+4. **Múltiplas Sessões Permitidas:**  
+   O estudante pode estar logado simultaneamente no computador e no celular. O logout revoga apenas a sessão do dispositivo que enviou a requisição.
+
+---
+
+## 4. Estrutura de Persistência e Armazenamento (Card #80)
+
+A persistência do banco de dados relacional **nunca armazena o token em texto claro**. Apenas o resumo criptográfico **SHA-256** com índice único é salvo:
+
+| Campo | Tipo | Restrição | Descrição |
+| :--- | :--- | :--- | :--- |
+| `sessao_id` | UUID | Chave Primária | Identificador interno do registro. |
+| `usuario_id` | UUID | Chave Estrangeira | ID do estudante proprietário da sessão. |
+| `token_hash` | String(64) | Único, Not Null | Hash SHA-256 do token recebido via cookie. |
+| `criada_em` | Timestamp UTC | Not Null | Data e hora exata de emissão. |
+| `expira_em` | Timestamp UTC | Not Null | Data e hora de expiração (`criada_em + 8 horas`). |
+| `revogada_em` | Timestamp UTC | Nullable | Data/hora em que o usuário fez logout (nulo se ativa). |
+
+---
+
+## 5. Diretivas do Cookie HTTP de Produção
+
+Em conformidade com as recomendações da OWASP e o padrão do navegador:
 
 ```http
-Set-Cookie: __Host-sessao=<token-opaco>; Path=/; Max-Age=28800; Secure; HttpOnly; SameSite=Lax
+Set-Cookie: __Host-sessao=<token-opaco-32bytes>; Path=/; Max-Age=28800; Secure; HttpOnly; SameSite=Lax
 ```
 
-O cookie não define `Domain`, conforme os requisitos do prefixo `__Host-`. Ele
-é enviado apenas em HTTPS. A aplicação cliente não lê, copia nem armazena o
-token em local storage, session storage, JavaScript ou estado persistente.
+* **`__Host-` Prefix:** Impede sobrescrita por subdomínios e exige envio exclusivo por HTTPS e caminho raiz (`Path=/`).
+* **`HttpOnly`:** Bloqueia qualquer leitura do cookie via JavaScript (`document.cookie`), prevenindo ataques de roubo de sessão via Cross-Site Scripting (XSS).
+* **`Secure`:** Garante que o cookie só trafegue em conexões criptografadas por TLS/HTTPS.
+* **`SameSite=Lax`:** Protege contra ataques de Cross-Site Request Forgery (CSRF) em navegação comum.
 
-O ambiente local pode usar configuração própria de cookie para HTTP em
-`localhost`, isolada da configuração de produção. Essa exceção não pode reduzir
-os atributos de produção nem ser habilitada em implantação pública.
+---
 
-## Operações HTTP
+## 6. Especificação dos Endpoints de Sessão (Card #82)
 
-### Criar sessão — `POST /acessos`
+Implementação: [`src/backend/api/cadastro_acesso.py`](file:///c:/Users/marce/Documents/GitHub/sistema-curriculo/src/backend/api/cadastro_acesso.py) e [`src/backend/api/sessoes.py`](file:///c:/Users/marce/Documents/GitHub/sistema-curriculo/src/backend/api/sessoes.py)
 
-Requisição:
+### 6.1. `POST /acessos` — Criar Sessão (Login)
+* **Status Público:** Rota pública (não exige sessão prévia).
+* **Payload de Envio:**
+  ```json
+  {
+    "email": "estudante@fatec.sp.gov.br",
+    "senha": "senha-segura-informada"
+  }
+  ```
+* **Respostas:**
+  * `HTTP 204 No Content` + `Set-Cookie` com o token em caso de sucesso.
+  * `HTTP 401 Unauthorized` uniforme (para e-mail inexistente ou senha incorreta, sem detalhar qual falhou para evitar enumeração de contas).
+  * `HTTP 422 Unprocessable Entity` para formato de e-mail inválido.
 
-```json
-{
-  "email": "estudante@example.com",
-  "senha": "senha-informada"
-}
-```
+### 6.2. `GET /sessao/atual` — Consultar Sessão Ativa
+* **Respostas:**
+  * `HTTP 200 OK`: `{"usuario_id": "c1f2e3d4-5678-90ab-cdef-1234567890ab"}`
+  * `HTTP 401 Unauthorized`: Caso o cookie esteja ausente, expirado ou revogado.
 
-Com credenciais válidas e conta não excluída, a API cria um registro de sessão,
-define o cookie de sessão e responde `204 No Content`. A senha não é devolvida
-nem persistida em texto claro.
+### 6.3. `DELETE /sessao/atual` — Encerrar Sessão (Logout)
+* **Comportamento:** Marca `revogada_em = NOW()` no banco de dados e retorna `Set-Cookie` com `Max-Age=0` para remoção do cookie no navegador.
+* **Idempotência:** Responde `HTTP 204 No Content` mesmo que a sessão já tenha expirado.
 
-Para e-mail inexistente, senha incorreta ou conta excluída, responde `401
-Unauthorized` com mensagem uniforme e sem `Set-Cookie`. A API não revela qual
-condição falhou. Falhas de validação do formato permanecem `422`; limitação de
-tentativas pode responder `429 Too Many Requests` sem revelar a existência da
-conta.
+---
 
-### Consultar sessão — `GET /sessao/atual`
+## 7. Funcionamento do Middleware em Rotas Privadas (Card #81)
 
-Com sessão válida, responde `200 OK` com a identidade pública mínima:
+Implementação: [`src/backend/api/middleware_autenticacao.py`](file:///c:/Users/marce/Documents/GitHub/sistema-curriculo/src/backend/api/middleware_autenticacao.py)
 
-```json
-{
-  "usuario_id": "uuid-da-conta"
-}
-```
+1. **Lista Branca de Rotas Públicas (`ROTAS_PUBLICAS`):**
+   * Acesso liberado sem checagem de cookie para: `POST /estudantes`, `POST /acessos`, `DELETE /sessao/atual`, `/health`, `/ready`, `/docs` e `/openapi.json`.
+2. **Intercepção de Rotas Privadas:**
+   * O middleware intercepta toda requisição privada, extrai o cookie `__Host-sessao`, calcula o SHA-256 e valida o registro no banco.
+   * Se a sessão estiver ativa, injeta `request.state.usuario_id` e atribui um código de rastreamento em `request.state.correlation_id` (devolvido no cabeçalho `X-Correlation-ID`).
+   * Se for inválida, responde imediatamente com `HTTP 401 Unauthorized` e mensagem `"Sessão ausente ou inválida."` sem acionar o banco de dados desnecessariamente.
 
-Sem cookie, com token desconhecido, expirado, revogado ou ligado a conta
-excluída, responde `401 Unauthorized`. A resposta não distingue esses casos.
-Essa rota não prolonga a sessão.
+---
 
-### Encerrar sessão — `DELETE /sessao/atual`
+## 8. Rastreabilidade com as Fatias do Projeto
 
-A API revoga a sessão correspondente ao cookie, se houver, e remove o cookie
-com `Max-Age=0`, `Path=/`, `Secure`, `HttpOnly` e `SameSite=Lax`. Responde
-`204 No Content` mesmo quando o cookie está ausente, inválido ou expirado,
-tornando o encerramento idempotente. A revogação impede o uso do mesmo token em
-requisições posteriores.
-
-## Validação em rotas protegidas
-
-A dependência comum de autenticação lê somente `__Host-sessao`, calcula seu
-SHA-256 e busca o registro correspondente. A sessão é válida somente se:
-
-1. o registro existe;
-2. `revogada_em` é nulo;
-3. `expira_em` é posterior ao instante UTC atual;
-4. a conta existe e não está logicamente excluída (`deleted_at` nulo).
-
-Se alguma condição falhar, a dependência responde `401` antes de chamar o caso
-de uso. Caso todas sejam satisfeitas, fornece `UsuarioAutenticado` à rota. A
-autorização e a propriedade de cada recurso usam o `usuario_id` desse contexto,
-nunca identidade enviada pelo cliente. A sessão não concede papel ou permissão
-por si só.
-
-### Interface da dependência
-
-Toda rota que exige sessão DEVE declarar autenticação por uma dependência comum
-da API, conceitualmente chamada `usuario_autenticado`. Em FastAPI, o uso
-esperado é equivalente a:
-
-```python
-async def consultar_dados(
-    usuario: UsuarioAutenticado = Depends(usuario_autenticado),
-) -> Resposta:
-    ...
-```
-
-A dependência lê exclusivamente o cookie `__Host-sessao`. Ela NÃO DEVE aceitar
-identidade, papel ou permissão enviados em caminho, query, corpo ou cabeçalhos
-pelo cliente. O handler obtém do contexto `usuario.usuario_id` para operações
-privadas; o contexto não é DTO de entrada nem entidade de domínio. A dependência
-deve ser substituível nos testes, e handlers não devem validar cookies
-individualmente.
-
-Falha de autenticação responde `401 Unauthorized` antes de executar o caso de
-uso. Sessão válida sem autorização ao recurso responde `403 Forbidden`, ou
-`404 Not Found` quando a política daquele recurso ocultar sua existência. A
-propriedade compara o identificador do recurso com o usuário autenticado, nunca
-com o proprietário declarado pelo cliente.
-
-### Classificação de rotas
-
-São públicas somente as rotas necessárias para criar uma conta, iniciar uma
-sessão, obter o token CSRF pré-autenticação e executar verificações operacionais
-sem dados pessoais. Cadastro de estudante pode ser público. `POST /acessos` é o
-login definido neste contrato; ele só cria sessão depois de validar credenciais
-e estado da conta. Rotas públicas continuam sujeitas a limites contra abuso e
-às proteções CSRF aplicáveis.
-
-Qualquer operação que leia ou altere informações pessoais ou profissionais do
-estudante DEVE exigir sessão. Na API atual, isso inclui:
-
-| Operação | Regra de interface |
-|---|---|
-| `PUT /estudantes/{usuario_id}` | Permitir alteração somente se o parâmetro corresponder a `usuario.usuario_id`; em revisão futura, preferir derivar o alvo da sessão e remover `{usuario_id}`. |
-| `DELETE /estudantes/{usuario_id}` | Limitar exclusão ao próprio perfil, usando a mesma regra de identidade. |
-| Rotas de dados de contato | Vincular leitura ou alteração ao perfil do usuário autenticado. |
-| Rotas de projetos acadêmicos | Vincular criação e alterações ao usuário autenticado. |
-
-Rotas futuras de formação, experiências, competências, consulta de perfil,
-currículos, visualização privada e exportação também serão protegidas quando
-expuserem ou modificarem dados de um estudante. Conteúdo explicitamente público
-só pode ser exceção com requisito funcional e política de exposição
-documentados. O inventário classifica recursos por sensibilidade; os caminhos
-HTTP definitivos devem ser registrados ao especificar cada endpoint.
-
-### Testes de rotas protegidas
-
-Cada rota protegida DEVE ter teste de API sem cookie de sessão que confirme
-`401 Unauthorized`, ausência de execução do caso de uso e ausência de alteração
-de estado. Use entrada válida para isolar autenticação de erros de validação.
-Cubra também cookie inválido, sessão expirada ou revogada e sessão válida. No
-caso válido, confirme que o identificador recebido pelo caso de uso veio do
-contexto autenticado e que valores enviados pelo cliente não permitem acesso à
-conta de outra pessoa.
-
-Os testes devem substituir a dependência de autenticação e os executores por
-doubles determinísticos, sem banco ou relógio real. Testes unitários de API
-executam no ambiente `backend`; testes de integração que exercitem persistência
-ou infraestrutura seguem o ambiente `tests` definido no `AGENTS.md` raiz.
-
-## CSRF e limites de transporte
-
-Como o navegador envia cookies automaticamente, operações que alteram estado
-DEVEM validar o cabeçalho `Origin` contra uma lista explícita de origens
-permitidas e aplicar proteção CSRF. `SameSite=Lax` é defesa adicional, não
-substitui esses controles. O formato, a emissão e a verificação do token CSRF
-devem ser definidos antes de habilitar operações mutáveis autenticadas por
-cookie em produção. O login também deve validar origem e limitar tentativas;
-credenciais e cookies só podem trafegar por HTTPS em produção.
-
-Tokens, senhas e cabeçalhos `Cookie`/`Set-Cookie` não podem aparecer em logs,
-mensagens de erro, métricas ou rastreamentos.
-
-## Revogação e limpeza
-
-- Logout revoga somente o registro associado ao token apresentado.
-- Exclusão lógica da conta invalida todas as sessões da conta; a validação
-  também rejeita imediatamente uma conta com `deleted_at` preenchido.
-- Uma futura alteração ou redefinição de senha deve revogar todas as sessões
-  existentes da conta após a atualização bem-sucedida da credencial.
-- Registros expirados ou revogados podem ser removidos por rotina de limpeza,
-  desde que a remoção não restaure sua validade nem afete auditoria exigida.
-
-## Testes de contrato
-
-Os testes de API devem cobrir emissão do cookie após login válido, ausência de
-cookie e resposta uniforme para credenciais inválidas, atributos do cookie,
-acesso com sessão ativa, rejeição de token desconhecido/expirado/revogado,
-rejeição de conta excluída e revogação idempotente no logout. Os testes devem
-controlar gerador aleatório, relógio e repositório de sessões por doubles; não
-devem usar banco ou relógio real para validar regras de sessão.
+* **Card #418 (`[F12.2]`):** Documentação consolidada do contrato de credenciais e ciclo de sessão entregue e alinhada à arquitetura do sistema.
+* **Cards #80, #81 e #82:** Rastreabilidade direta com os componentes de armazenamento de sessão, middleware de segurança e endpoints REST desenvolvidos pela Kelly Mendes.
