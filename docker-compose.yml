@@ -1,0 +1,43 @@
+services:
+  # 1. Banco de Dados Relacional da Aplicação
+  db:
+    image: postgres:16-alpine
+    container_name: sistema_curriculo_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sistema_curriculo_dev
+      POSTGRES_USER: curriculo_app_user
+      POSTGRES_PASSWORD: dev_secret_password_local
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U curriculo_app_user -d sistema_curriculo_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. Servidor de API Backend (FastAPI + Uvicorn)
+  app:
+    build: .
+    container_name: sistema_curriculo_app
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://curriculo_app_user:dev_secret_password_local@db:5432/sistema_curriculo_dev
+      APP_PORT: 3000
+      APP_ENV: development
+      LOG_LEVEL: debug
+      GRUPO2_API_URL: http://host.docker.internal:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      # Monta o código local para hot-reload imediato em desenvolvimento
+      - ./src:/app/src
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "3000", "--reload"]
+
+volumes:
+  pgdata:
